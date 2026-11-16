@@ -199,7 +199,7 @@ function nextSpecial(s, i) {
 }
 function isFlank(c) { return c !== undefined && !isSpace(c); }
 
-function scanInline(str, refs) {
+function scanInline(str, refs, linkText) {
   const nodes = [], delims = [];
   const spans = findExtAutolinks(str);
   let si = 0;
@@ -210,13 +210,21 @@ function scanInline(str, refs) {
     const last = nodes[nodes.length - 1];
     if (last && last.t === 'x') last.s += t; else nodes.push({ t: 'x', s: t });
   };
+  // Emit an extended-autolink span. In link text a bare URL stays literal
+  // (the outer link forms) — EXCEPT when it directly follows '<': then it
+  // is an unclosed <...> autolink attempt whose '>' lies beyond the label,
+  // and the outer link must not form (cm-526).
+  const emitExtSpan = (sp) => {
+    if (linkText && str[sp.start - 1] !== '<') { pushText(sp.text); return; }
+    nodes.push({ t: 'a', href: sp.href, title: null });
+    pushText(sp.text);
+    nodes.push({ t: 'A' });
+  };
   while (p < n) {
     while (si < spans.length && spans[si].start < p) si++; // stale spans start inside a consumed construct
     if (si < spans.length && spans[si].start === p) {
       const sp = spans[si++];
-      nodes.push({ t: 'a', href: sp.href, title: null });
-      pushText(sp.text);
-      nodes.push({ t: 'A' });
+      emitExtSpan(sp);
       p = sp.end;
       continue;
     }
@@ -261,7 +269,7 @@ function scanInline(str, refs) {
     if (cc === 60) { // < : autolink or raw html tag
       const al = scanAutolink(str, p);
       if (al) {
-        nodes.push({ t: 'a', href: al.href, title: null });
+        nodes.push({ t: 'a', href: al.href, title: null, auto: true });
         pushText(al.text);
         nodes.push({ t: 'A' });
         p = al.end; continue;
@@ -325,19 +333,20 @@ function scanInline(str, refs) {
       }
       pushText('\n'); p++; continue;
     }
-    // plain text run up to next special char (may contain autolink spans)
+    // plain text run up to next special char (may contain autolink spans).
+    // A span can extend past `end` (its URL may contain & which ends the
+    // chunk): the cursor must jump past the span end, not rewind to `end`,
+    // or the span's tail is emitted twice as plain text.
     const end = nextSpecial(str, p);
     let q = p;
     while (si < spans.length && spans[si].start < end) {
       const sp = spans[si];
       if (sp.start > q) pushText(str.slice(q, sp.start));
-      nodes.push({ t: 'a', href: sp.href, title: null });
-      pushText(sp.text);
-      nodes.push({ t: 'A' });
+      emitExtSpan(sp);
       q = sp.end; si++;
     }
     pushText(str.slice(q, end));
-    p = end;
+    p = Math.max(end, q);
   }
   return { nodes, delims };
 }
@@ -641,10 +650,12 @@ function tryLink(s, p, refs, isImg) {
       j = close + 1;
     }
   }
-  const inner = scanInline(content, refs);
+  const inner = scanInline(content, refs, true); // link text: bare URLs literal, <...> autolinks nest
   resolveEmphasis(inner.delims); // link text emphasis resolves within the link only
   if (!isImg) {
-    for (const nd of inner.nodes) if (nd.t === 'a') return null; // links can't nest; images can
+    // links can't nest — but a <...> autolink inside link text nests fine
+    // (auto:true); only bracket links and unclosed-<...> autolink attempts block
+    for (const nd of inner.nodes) if (nd.t === 'a' && !nd.auto) return null;
     return { href, title, nodes: inner.nodes, end: j };
   }
   const altNodes = inner.nodes.map(nd => nd.t === 'i' ? { t: 'x', s: nd.alt } : nd);
@@ -1308,7 +1319,21 @@ function parseList(lines, i, end, refs, base) {
             if (li.indent === curCC || li.indent >= curCC + 4) loose = true;
           }
         }
-        if (listMarker(r)) cur.nested.push(li.indent);
+        // Track the nested list by its CONTENT indent, not its marker indent:
+        // a line after a blank is inside the nested list only when its indent
+        // reaches the nested list's content indent (cm-325).
+        const lmN = listMarker(r);
+        if (lmN) {
+          const mcN = li.indent + lmN.markerLen;
+          let sN = 0, kN = lmN.markerLen;
+          while (kN < r.length && (r[kN] === ' ' || r[kN] === '\t')) {
+            if (r[kN] === ' ') sN++;
+            else sN += 4 - ((mcN + sN) % 4);
+            kN++;
+          }
+          const hcN = kN < r.length;
+          cur.nested.push(hcN ? (sN <= 4 ? mcN + sN : mcN + 1) : mcN + 1);
+        }
         const f = fenceStart(stripped);
         if (f) inFence = f;
       }
@@ -1415,7 +1440,9 @@ function renderItem(item, tight, refs) {
 export function parse(md) {
   const refs = new Map();
   const text = md.replace(/\r\n?/g, '\n');
-  const lines = text.split('\n').map(l => expandLead(l, 0));
+  const lines = text.split('\n'); // raw lines: leading tabs are NOT expanded here —
+  // lineIndent/stripCols measure tabs by virtual columns, and fenced/HTML
+  // code content must keep literal tabs (expanding them breaks doc cases)
   if (lines.length && lines[lines.length - 1] === '') lines.pop();
   const blocks = parseBlocks(lines, 0, lines.length, refs, true, 0, text.endsWith('\n'));
   return renderBlocks(blocks, refs, false);

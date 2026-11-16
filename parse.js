@@ -175,6 +175,12 @@ function isUniPunct(ch) {
 function isSpace(ch) {
   return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f' || ch === '\v';
 }
+// Unicode whitespace (CommonMark flanking counts NBSP etc. as whitespace).
+function isUniWs(ch) {
+  return ch === undefined || isSpace(ch) || ch === '\u00A0' || ch === '\u0085' || ch === '\u1680' ||
+    (ch >= '\u2000' && ch <= '\u200A') || ch === '\u2028' || ch === '\u2029' ||
+    ch === '\u202F' || ch === '\u205F' || ch === '\u3000';
+}
 function isWhite(ch) { return ch === ' ' || ch === '\n' || ch === '\t'; }
 
 // ---- Inline scanner ----
@@ -195,6 +201,8 @@ function isFlank(c) { return c !== undefined && !isSpace(c); }
 
 function scanInline(str, refs) {
   const nodes = [], delims = [];
+  const spans = findExtAutolinks(str);
+  let si = 0;
   const n = str.length;
   let p = 0;
   const pushText = (t) => {
@@ -203,6 +211,15 @@ function scanInline(str, refs) {
     if (last && last.t === 'x') last.s += t; else nodes.push({ t: 'x', s: t });
   };
   while (p < n) {
+    while (si < spans.length && spans[si].start < p) si++; // stale spans start inside a consumed construct
+    if (si < spans.length && spans[si].start === p) {
+      const sp = spans[si++];
+      nodes.push({ t: 'a', href: sp.href, title: null });
+      pushText(sp.text);
+      nodes.push({ t: 'A' });
+      p = sp.end;
+      continue;
+    }
     const ch = str[p], cc = str.charCodeAt(p);
     if (cc === 92) { // backslash
       const nx = str[p + 1];
@@ -258,8 +275,8 @@ function scanInline(str, refs) {
       while (q < n && str.charCodeAt(q) === cc) { q++; len++; }
       const prev = p > 0 ? str[p - 1] : undefined;
       const next = q < n ? str[q] : undefined;
-      const prevWs = prev === undefined || isSpace(prev);
-      const nextWs = next === undefined || isSpace(next);
+      const prevWs = isUniWs(prev);
+      const nextWs = isUniWs(next);
       const prevP = prev !== undefined && isUniPunct(prev);
       const nextP = next !== undefined && isUniPunct(next);
       const leftFlank = !nextWs && (!nextP || prevWs || prevP);
@@ -308,68 +325,77 @@ function scanInline(str, refs) {
       }
       pushText('\n'); p++; continue;
     }
-    // plain text run up to next special char
+    // plain text run up to next special char (may contain autolink spans)
     const end = nextSpecial(str, p);
-    emitTextWithAutolinks(str.slice(p, end), p, nodes, str);
+    let q = p;
+    while (si < spans.length && spans[si].start < end) {
+      const sp = spans[si];
+      if (sp.start > q) pushText(str.slice(q, sp.start));
+      nodes.push({ t: 'a', href: sp.href, title: null });
+      pushText(sp.text);
+      nodes.push({ t: 'A' });
+      q = sp.end; si++;
+    }
+    pushText(str.slice(q, end));
     p = end;
   }
   return { nodes, delims };
 }
 
-// Scan a plain-text chunk for GFM extended autolinks (www., scheme://, email).
-const EXT_RE = /(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:\/\/[^\s<>\[\]]+|www\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?:\/[^\s<>\[\]]*)?|[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)/g;
-function emitTextWithAutolinks(chunk, chunkStart, nodes, full) {
-  if (!chunk) return;
-  const pushText = (t) => {
-    if (!t) return;
-    const last = nodes[nodes.length - 1];
-    if (last && last.t === 'x') last.s += t; else nodes.push({ t: 'x', s: t });
-  };
+// GFM extended autolinks (www., scheme://, scheme:email, email), scanned over
+// the whole inline string: emails can contain _ and URLs can contain &, which
+// the chunk scanner would otherwise split. Returns [{start, end, href, text}].
+const EXT_RE = /(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:\/\/[^\s<>\[\]]+|www\.[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?:\/[^\s<>\[\]]*)?|[A-Za-z][A-Za-z0-9+.-]{1,31}:[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+(?:\/[^\s<>\[\]\/]+)?|[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)/g;
+function findExtAutolinks(str) {
+  const spans = [];
   EXT_RE.lastIndex = 0;
-  let m, last = 0;
-  while ((m = EXT_RE.exec(chunk)) !== null) {
+  let m;
+  while ((m = EXT_RE.exec(str)) !== null) {
     const cand = m[0];
-    const absStart = chunkStart + m.index;
-    const prev = absStart > 0 ? full[absStart - 1] : undefined;
+    const prev = m.index > 0 ? str[m.index - 1] : undefined;
     const prevOk = prev === undefined || isSpace(prev) || '*_~([<!>,;:'.includes(prev);
-    if (!prevOk) continue;
-    // strip trailing punctuation: ?!.,:;*_~'" and unbalanced )
-    let end = cand.length;
-    let opens = 0;
-    for (let i = 0; i < cand.length; i++) {
-      if (cand[i] === '(') opens++;
-      else if (cand[i] === ')') opens--;
+    if (!prevOk) { EXT_RE.lastIndex = m.index + 1; continue; }
+    // strip trailing punctuation (? ! . , : ; * _ ~ ' ") and unbalanced ),
+    // and a trailing entity-like &name; (which ends the link before the &)
+    let text = cand;
+    for (let round = 0; round < 2; round++) {
+      const amp = text.lastIndexOf('&');
+      if (amp > 0 && /^&(?:#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);$/.test(text.slice(amp))) {
+        text = text.slice(0, amp);
+      }
+      let end = text.length, opens = 0;
+      for (let i = 0; i < text.length; i++) {
+        if (text[i] === '(') opens++;
+        else if (text[i] === ')') opens--;
+      }
+      while (end > 0) {
+        const c = text[end - 1];
+        if ('?!.,:;*_~\'"'.includes(c)) { end--; continue; }
+        if (c === ')' && opens < 0) { end--; opens++; continue; }
+        break;
+      }
+      text = text.slice(0, end);
     }
-    while (end > 0) {
-      const c = cand[end - 1];
-      if ('?!.,:;*_~\'"'.includes(c)) { end--; continue; }
-      if (c === ')' && opens < 0) { end--; opens++; continue; }
-      break;
-    }
-    const text = cand.slice(0, end);
-    if (!text) continue;
+    if (!text) { EXT_RE.lastIndex = m.index + 1; continue; }
+    // a - or _ right after the match voids it (the address could continue)
+    const after = str[m.index + cand.length];
+    if (after === '-' || after === '_') { EXT_RE.lastIndex = m.index + 1; continue; }
     let href = null, ok = false;
     if (text.startsWith('www.')) {
       if (text.indexOf('.', 4) > 4) { href = cleanUrl('http://' + text); ok = href !== null; }
     } else if (text.includes('://')) {
       href = cleanUrl(text); ok = href !== null;
+    } else if (/^[A-Za-z][A-Za-z0-9+.-]{1,31}:/.test(text) && text.includes('@')) {
+      href = cleanUrl(text); ok = href !== null; // scheme:email
     } else if (text.includes('@')) {
       const at = text.lastIndexOf('@');
       const domain = text.slice(at + 1);
-      const tld = domain.split('.').pop();
-      if (domain.includes('.') && tld.length >= 2 && /^[A-Za-z]+$/.test(tld)) {
-        href = cleanUrl('mailto:' + text); ok = href !== null;
-      }
+      if (domain.includes('.')) { href = cleanUrl('mailto:' + text); ok = href !== null; }
     }
-    if (!ok) continue;
-    pushText(chunk.slice(last, m.index));
-    nodes.push({ t: 'a', href, title: null });
-    pushText(text);
-    nodes.push({ t: 'A' });
-    last = m.index + end;
-    EXT_RE.lastIndex = last;
+    if (!ok) { EXT_RE.lastIndex = m.index + 1; continue; }
+    spans.push({ start: m.index, end: m.index + text.length, href, text });
   }
-  pushText(chunk.slice(last));
+  return spans;
 }
 
 // <scheme:...> or <email> autolink. Returns {t:'a', href, title, end} or null.
@@ -444,9 +470,12 @@ function scanHtmlTag(s, p) {
       j++;
       while (j < n && isSpace(s[j])) j++;
       if (j < n && s[j] === '"') {
-        let k = j + 1; // double-quoted value: no backslash allowed (marked rejects \")
-        while (k < n && s[k] !== '"' && s[k] !== '\\') k++;
-        if (k >= n || s[k] !== '"') return null;
+        let k = j + 1; // \" inside a double-quoted value invalidates the tag
+        while (k < n && s[k] !== '"') {
+          if (s[k] === '\\' && s[k + 1] === '"') return null;
+          k++;
+        }
+        if (k >= n) return null;
         i = k + 1;
       } else if (j < n && s[j] === "'") {
         let k = j + 1;
@@ -487,6 +516,10 @@ function findMatchingBracket(s, p) {
     }
     if (c === '[') depth++;
     else if (c === ']') { depth--; if (depth === 0) return i; }
+    else if (c === '<') {
+      const tag = scanHtmlTag(s, i);
+      if (tag) { i += tag.length; continue; }
+    }
     i++;
   }
   return -1;
@@ -595,6 +628,7 @@ function tryLink(s, p, refs, isImg) {
       if (lc === -1) return null;
       let label = s.slice(j + 1, lc);
       if (!label) label = content;
+      if (/(^|[^\\])\[/.test(label)) return null; // labels can't contain unescaped [
       const ref = refs.get(normalizeLabel(label));
       if (!ref || ref.href === null) return null;
       href = ref.href; title = ref.title;
@@ -621,6 +655,7 @@ function tryLink(s, p, refs, isImg) {
 // ---- Emphasis resolution ----
 let matchOrder = 0;
 function resolveEmphasis(delims) {
+  const spans = []; // [opener index, closer index] of matched spans
   for (let ci = 0; ci < delims.length; ci++) {
     const closer = delims[ci];
     if (!closer.close || closer.len === 0) continue;
@@ -628,6 +663,10 @@ function resolveEmphasis(delims) {
     while (oi >= 0) {
       const opener = delims[oi];
       if (opener.ch !== closer.ch || !opener.open || opener.len === 0) { oi--; continue; }
+      // an opener inside a matched span cannot match a closer outside it
+      let inside = false;
+      for (const sp of spans) if (oi > sp[0] && oi < sp[1] && ci > sp[1]) { inside = true; break; }
+      if (inside) { oi--; continue; }
       const oLen = opener.len + opener.used, cLen = closer.len + closer.used;
       if ((opener.open && opener.close) || (closer.open && closer.close)) {
         const sum = oLen + cLen;
@@ -646,6 +685,7 @@ function resolveEmphasis(delims) {
       closer.ct.push({ tag, oi, ord });
       opener.used += use; closer.used += use;
       opener.len -= use; closer.len -= use;
+      spans.push([oi, ci]);
       if (closer.len === 0) break;
       if (opener.len === 0) oi--;
       // else retry the same opener (e.g. ***foo*** -> <em><strong>foo</strong></em>)
@@ -764,6 +804,7 @@ function parseRefDef(text, i, refs) {
     label += c; k++;
   }
   if (k >= n || !label || text[k] !== ']' || text[k + 1] !== ':') return null;
+  if (/(^|[^\\])\[/.test(label)) return null; // labels can't contain unescaped [
   const norm = normalizeLabel(label);
   if (!norm) return null;
   k += 2;
@@ -886,9 +927,9 @@ function htmlBlockStart(rest, paraOpen) {
     const ok = afterTag === '' || afterTag[0] === ' ' || afterTag[0] === '\t' || afterTag[0] === '\n' || afterTag[0] === '>' || afterTag.startsWith('/>');
     if (ok && BLOCK_TAGS.has(tag)) return { type: 6, endBlank: true };
     if (ok && !paraOpen) {
-      // type 7: complete open/close tag, alone on the line (only whitespace after)
-      const full = /^<\/?[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>]*)?\/?>[ \t]*$/.exec(rest);
-      if (full) return { type: 7, endBlank: true };
+      // type 7: a complete, strictly valid tag alone on the line
+      const full = scanHtmlTag(rest, 0);
+      if (full && /^[ \t]*$/.test(rest.slice(full.length))) return { type: 7, endBlank: true };
     }
   }
   return null;
@@ -1082,6 +1123,7 @@ function parseBlocks(lines, start, end, refs, top, base, endsNL) {
         const content = [];
         i++;
         while (i < end && !fenceEnd(lines[i], f)) { content.push(stripCols(lines[i], indent)); i++; }
+        if (content.length && content[content.length - 1] === '') content.pop(); // one trailing blank line is not content
         if (i < end) i++;
         const lang = f.info ? unescapeStr(f.info.split(/\s+/)[0]) : null;
         blocks.push({ t: 'code', lang, text: content.length ? content.join('\n') + '\n' : '' });
@@ -1198,7 +1240,7 @@ function parseList(lines, i, end, refs, base) {
   };
   const startItem = (line, markerLen, contentIndent, markerIndent) => {
     curCC = contentIndent;
-    cur = { lines: [], checked: null, seenContent: false, blankAfter: false, base: base + contentIndent };
+    cur = { lines: [], checked: null, seenContent: false, blankAfter: false, base: base + contentIndent, nested: [] };
     const { cs } = lineIndent(line);
     const after = line.slice(cs + markerLen);
     const content = expandLead(stripCols(after, contentIndent - markerLen, markerIndent + markerLen), base + contentIndent);
@@ -1257,7 +1299,16 @@ function parseList(lines, i, end, refs, base) {
       if (inFence !== null) {
         if (fenceEnd(stripped, inFence)) inFence = null;
       } else {
-        if (cur.blankAfter) loose = true;
+        // A blank line makes this list loose only when the next content line
+        // starts a new direct block of the item (at its content indent, or an
+        // indented code block) and is not inside an open nested list.
+        if (cur.blankAfter) {
+          const deepest = cur.nested.length ? Math.max(...cur.nested) : -1;
+          if (li.indent < deepest || deepest === -1) {
+            if (li.indent === curCC || li.indent >= curCC + 4) loose = true;
+          }
+        }
+        if (listMarker(r)) cur.nested.push(li.indent);
         const f = fenceStart(stripped);
         if (f) inFence = f;
       }
